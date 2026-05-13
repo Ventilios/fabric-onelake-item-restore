@@ -35,8 +35,8 @@ Parameters:
 
 | Name | Required | Description |
 | --- | --- | --- |
-| `-WorkspaceName` | yes | Fabric workspace name. Use the workspace **GUID** if the name has characters that violate Azure Storage naming rules. |
-| `-LakehouseName` | yes | Lakehouse item name **without** the `.Lakehouse` suffix. |
+| `-WorkspaceName` | yes | Fabric workspace display name **or** GUID. If the display name contains characters that violate Azure Storage container naming rules (spaces, uppercase, etc.), the script resolves it to the workspace GUID via the Fabric REST API. |
+| `-LakehouseName` | yes | Lakehouse display name **or** GUID. When the workspace is resolved to a GUID, the lakehouse is resolved as well (the data-plane API does not allow mixing friendly names and GUIDs). Omit the `.Lakehouse` suffix. |
 | `-Scope` | no | `Files`, `Tables`, or `Both` (default). |
 | `-SubPath` | no | Extra sub-path under `Files/`/`Tables/`, e.g. `raw/2026`. |
 | `-OutputCsv` | no | Output CSV path. Default: `.\onelake-deleted-inventory.csv`. |
@@ -80,8 +80,8 @@ Parameters:
 
 | Name | Required | Description |
 | --- | --- | --- |
-| `-WorkspaceName` | yes | Fabric workspace name or GUID. |
-| `-LakehouseName` | yes | Lakehouse item name without `.Lakehouse`. |
+| `-WorkspaceName` | yes | Fabric workspace display name or GUID (auto-resolved if needed). |
+| `-LakehouseName` | yes | Lakehouse display name or GUID (auto-resolved when workspace is). |
 | `-InventoryCsv` | no | CSV produced by Step 1. If omitted, the script re-scans. |
 | `-Path` | no | Sub-path to re-scan when no `-InventoryCsv` is provided (e.g. `Tables`). |
 | `-NameLike` | no | Wildcard filter on the blob path (e.g. `*orders*`). |
@@ -119,6 +119,13 @@ In Fabric you may need to refresh the lakehouse explorer for a restored
 table to reappear in the Tables list.
 
 ## Troubleshooting
+
+- **`Container name '...' is invalid.` / `FriendlyNameSupportDisabled`**
+  Triggered when a workspace or lakehouse display name contains characters
+  the OneLake storage endpoint rejects (spaces, uppercase, etc.). Both
+  scripts detect this and resolve the names to GUIDs via the Fabric REST
+  API automatically. If resolution fails (e.g. the name is ambiguous), pass
+  the GUIDs directly via `-WorkspaceName` and `-LakehouseName`.
 
 - **`SharedTokenCacheCredential authentication unavailable. No accounts were
   found in the cache.`**

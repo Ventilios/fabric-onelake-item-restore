@@ -1,0 +1,6 @@
+# Editor / IDE
+.vscode/
+
+# Inventory output (may contain workspace/lakehouse names)
+onelake-deleted-inventory.csv
+*.csv

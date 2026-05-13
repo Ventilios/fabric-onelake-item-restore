@@ -13,12 +13,15 @@
     This script:
       1. Ensures the Az.Storage module is available.
       2. Signs in to Azure and lets you review/switch the active context.
-      3. Creates a OneLake storage context against fabric.microsoft.com.
-      4. Sources the list of items to restore from either:
+      3. Resolves workspace/lakehouse display names to GUIDs via the Fabric
+         REST API when they contain characters that the storage data-plane
+         does not accept (spaces, uppercase, etc.).
+      4. Creates a OneLake storage context against fabric.microsoft.com.
+      5. Sources the list of items to restore from either:
            - the inventory CSV produced by Step 1, or
            - a fresh scan with Get-AzDataLakeGen2DeletedItem.
-      5. Optionally filters items by name pattern (-NameLike).
-      6. Previews the items, asks for confirmation (unless -Force), then
+      6. Optionally filters items by name pattern (-NameLike).
+      7. Previews the items, asks for confirmation (unless -Force), then
          restores each one via Restore-AzDataLakeGen2DeletedItem.
 
     References:
@@ -26,10 +29,13 @@
       - https://learn.microsoft.com/en-us/azure/storage/blobs/soft-delete-blob-manage
 
 .PARAMETER WorkspaceName
-    Fabric workspace name (or GUID) used as the OneLake container/filesystem.
+    Fabric workspace display name or GUID. Auto-resolved to a GUID via the
+    Fabric REST API when the display name does not meet Azure Storage
+    container naming rules.
 
 .PARAMETER LakehouseName
-    Lakehouse item name (without the .Lakehouse suffix).
+    Lakehouse display name (without the ".Lakehouse" suffix) or GUID.
+    Auto-resolved when the workspace is resolved.
 
 .PARAMETER InventoryCsv
     Path to the CSV produced by Step 1. If omitted, the script will re-scan.
@@ -180,7 +186,88 @@ while ($true) {
 Write-Host ("  Using: {0} | tenant {1}" -f $ctxAz.Account.Id, $ctxAz.Tenant.Id) -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# 2. OneLake context
+# 2. Resolve workspace name -> GUID if needed
+# ---------------------------------------------------------------------------
+# OneLake uses the workspace name as the storage container / ADLS Gen2
+# filesystem. Azure Storage container names must be all lower case, 3-63
+# chars, no spaces. Fabric workspace display names allow spaces and mixed
+# case, so when the display name doesn't satisfy those rules we resolve it
+# to the workspace GUID via the Fabric REST API.
+function Test-IsGuid {
+    param([string]$Value)
+    return [Guid]::TryParse($Value, [ref]([Guid]::Empty))
+}
+
+function Test-IsValidContainerName {
+    param([string]$Value)
+    return $Value -cmatch '^[a-z0-9](?:[a-z0-9]|-(?!-)){1,61}[a-z0-9]$'
+}
+
+function Get-FabricAccessToken {
+    $tokenObj = Get-AzAccessToken -ResourceUrl 'https://api.fabric.microsoft.com' -ErrorAction Stop
+    if ($tokenObj.Token -is [System.Security.SecureString]) {
+        return [System.Net.NetworkCredential]::new('', $tokenObj.Token).Password
+    }
+    return $tokenObj.Token
+}
+
+function Resolve-FabricWorkspaceId {
+    param([string]$DisplayName, [string]$AccessToken)
+    $headers = @{ Authorization = "Bearer $AccessToken" }
+    $uri = 'https://api.fabric.microsoft.com/v1/workspaces'
+    $found = @()
+    while ($uri) {
+        $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers -ErrorAction Stop
+        $found += @($resp.value | Where-Object { $_.displayName -eq $DisplayName })
+        $uri = $resp.continuationUri
+    }
+    if ($found.Count -eq 0) {
+        throw "Fabric workspace '$DisplayName' was not found for the current user."
+    }
+    if ($found.Count -gt 1) {
+        throw "Multiple Fabric workspaces named '$DisplayName' were found. Pass the workspace GUID directly via -WorkspaceName."
+    }
+    return $found[0].id
+}
+
+function Resolve-FabricLakehouseId {
+    param([string]$WorkspaceId, [string]$DisplayName, [string]$AccessToken)
+    $headers = @{ Authorization = "Bearer $AccessToken" }
+    $uri = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/lakehouses"
+    $found = @()
+    while ($uri) {
+        $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers -ErrorAction Stop
+        $found += @($resp.value | Where-Object { $_.displayName -eq $DisplayName })
+        $uri = $resp.continuationUri
+    }
+    if ($found.Count -eq 0) {
+        throw "Lakehouse '$DisplayName' was not found in workspace $WorkspaceId."
+    }
+    if ($found.Count -gt 1) {
+        throw "Multiple lakehouses named '$DisplayName' were found. Pass the lakehouse GUID directly via -LakehouseName."
+    }
+    return $found[0].id
+}
+
+$WorkspaceId = $WorkspaceName
+$LakehouseId = $LakehouseName
+$useGuids    = $false
+if (-not (Test-IsGuid $WorkspaceName) -and -not (Test-IsValidContainerName $WorkspaceName)) {
+    Write-Host ("Resolving workspace '{0}' to its GUID via the Fabric API..." -f $WorkspaceName) -ForegroundColor Cyan
+    $token = Get-FabricAccessToken
+    $WorkspaceId = Resolve-FabricWorkspaceId -DisplayName $WorkspaceName -AccessToken $token
+    Write-Host ("  Workspace ID: {0}" -f $WorkspaceId) -ForegroundColor Green
+
+    if (-not (Test-IsGuid $LakehouseName)) {
+        Write-Host ("Resolving lakehouse '{0}' to its GUID..." -f $LakehouseName) -ForegroundColor Cyan
+        $LakehouseId = Resolve-FabricLakehouseId -WorkspaceId $WorkspaceId -DisplayName $LakehouseName -AccessToken $token
+        Write-Host ("  Lakehouse ID: {0}" -f $LakehouseId) -ForegroundColor Green
+    }
+    $useGuids = $true
+}
+
+# ---------------------------------------------------------------------------
+# 3. OneLake context
 # ---------------------------------------------------------------------------
 # OneLake is addressed as the storage account "onelake" on the
 # fabric.microsoft.com endpoint. The current Az PowerShell sign-in is used
@@ -191,11 +278,12 @@ $ctx = New-AzStorageContext `
     -UseConnectedAccount `
     -Endpoint 'fabric.microsoft.com'
 
-# Lakehouse items in OneLake are addressed as "<name>.Lakehouse".
-$itemRoot = "$LakehouseName.Lakehouse"
+# Lakehouse items in OneLake are addressed as "<name>.Lakehouse" with
+# friendly names, or just "<itemGuid>" with GUIDs.
+$itemRoot = if ($useGuids) { $LakehouseId } else { "$LakehouseName.Lakehouse" }
 
 # ---------------------------------------------------------------------------
-# 3. Source the list of items to restore
+# 4. Source the list of items to restore
 # ---------------------------------------------------------------------------
 $targets = New-Object System.Collections.Generic.List[object]
 
@@ -219,11 +307,11 @@ if ($InventoryCsv) {
     }
 } else {
     $scanPath = if ($Path) { "$itemRoot/$($Path.Trim('/'))" } else { $itemRoot }
-    Write-Host ("Re-scanning for deleted items under: {0}/{1}" -f $WorkspaceName, $scanPath) -ForegroundColor Cyan
+    Write-Host ("Re-scanning for deleted items under: {0}/{1}" -f $WorkspaceId, $scanPath) -ForegroundColor Cyan
 
     $deleted = Get-AzDataLakeGen2DeletedItem `
         -Context $ctx `
-        -FileSystem $WorkspaceName `
+        -FileSystem $WorkspaceId `
         -Path $scanPath
 
     foreach ($d in $deleted) {
@@ -246,7 +334,7 @@ if ($targets.Count -eq 0) {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Preview + confirm
+# 5. Preview + confirm
 # ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host ("Items to restore ({0}):" -f $targets.Count) -ForegroundColor Yellow
@@ -261,7 +349,7 @@ if (-not $Force) {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Restore
+# 6. Restore
 # ---------------------------------------------------------------------------
 $results = New-Object System.Collections.Generic.List[object]
 
@@ -277,7 +365,7 @@ foreach ($t in $targets) {
         # restored or the 7-day retention has expired.
         $deletedItem = Get-AzDataLakeGen2DeletedItem `
             -Context $ctx `
-            -FileSystem $WorkspaceName `
+            -FileSystem $WorkspaceId `
             -Path $t.Path `
             -ErrorAction Stop | Select-Object -First 1
 
@@ -305,7 +393,7 @@ foreach ($t in $targets) {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Summary
+# 7. Summary
 # ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host 'Restore summary:' -ForegroundColor Cyan

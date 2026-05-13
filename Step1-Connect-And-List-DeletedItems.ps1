@@ -23,13 +23,17 @@
       - https://learn.microsoft.com/en-us/fabric/onelake/onelake-disaster-recovery
 
 .PARAMETER WorkspaceName
-    Fabric workspace name, which OneLake exposes as the storage "container" /
-    ADLS Gen2 filesystem. If the workspace name contains characters that
-    violate Azure Storage naming rules, pass the workspace GUID instead.
+    Fabric workspace display name **or** GUID. OneLake exposes the workspace
+    as the ADLS Gen2 filesystem (storage "container"), whose names must be
+    lowercase, 3-63 chars, and contain no spaces. If the display name does
+    not meet those rules, the script resolves it to the workspace GUID via
+    the Fabric REST API automatically.
 
 .PARAMETER LakehouseName
-    Lakehouse item name without the ".Lakehouse" suffix. The script appends
-    ".Lakehouse" automatically (e.g. "sales" -> "sales.Lakehouse").
+    Lakehouse display name (without the ".Lakehouse" suffix) or GUID.
+    When the workspace is resolved to a GUID, the lakehouse is resolved as
+    well (the OneLake data-plane API rejects mixing friendly names and
+    GUIDs).
 
 .PARAMETER Scope
     Which sub-path under the lakehouse to scan. One of: Files, Tables, Both.
@@ -178,7 +182,94 @@ while ($true) {
 Write-Host ("  Using: {0} | tenant {1}" -f $ctxAz.Account.Id, $ctxAz.Tenant.Id) -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# 3. Build OneLake storage context
+# 3. Resolve workspace name -> GUID if needed
+# ---------------------------------------------------------------------------
+# The OneLake data-plane uses the workspace name as the storage "container"
+# (ADLS Gen2 filesystem). Azure Storage container names must be all lower
+# case, 3-63 chars, no spaces. Fabric workspace *display* names allow spaces,
+# mixed case, etc. - so for any display name that doesn't satisfy the
+# container naming rules we must resolve it to the workspace GUID via the
+# Fabric REST API.
+function Test-IsGuid {
+    param([string]$Value)
+    return [Guid]::TryParse($Value, [ref]([Guid]::Empty))
+}
+
+function Test-IsValidContainerName {
+    param([string]$Value)
+    return $Value -cmatch '^[a-z0-9](?:[a-z0-9]|-(?!-)){1,61}[a-z0-9]$'
+}
+
+function Get-FabricAccessToken {
+    # Az 14+ returns a SecureString by default; older versions return a plain
+    # string. Handle both.
+    $tokenObj = Get-AzAccessToken -ResourceUrl 'https://api.fabric.microsoft.com' -ErrorAction Stop
+    if ($tokenObj.Token -is [System.Security.SecureString]) {
+        return [System.Net.NetworkCredential]::new('', $tokenObj.Token).Password
+    }
+    return $tokenObj.Token
+}
+
+function Resolve-FabricWorkspaceId {
+    param([string]$DisplayName, [string]$AccessToken)
+    $headers = @{ Authorization = "Bearer $AccessToken" }
+    $uri = 'https://api.fabric.microsoft.com/v1/workspaces'
+    $found = @()
+    while ($uri) {
+        $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers -ErrorAction Stop
+        $found += @($resp.value | Where-Object { $_.displayName -eq $DisplayName })
+        $uri = $resp.continuationUri
+    }
+    if ($found.Count -eq 0) {
+        throw "Fabric workspace '$DisplayName' was not found for the current user."
+    }
+    if ($found.Count -gt 1) {
+        throw "Multiple Fabric workspaces named '$DisplayName' were found. Pass the workspace GUID directly via -WorkspaceName."
+    }
+    return $found[0].id
+}
+
+function Resolve-FabricLakehouseId {
+    param([string]$WorkspaceId, [string]$DisplayName, [string]$AccessToken)
+    $headers = @{ Authorization = "Bearer $AccessToken" }
+    $uri = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/lakehouses"
+    $found = @()
+    while ($uri) {
+        $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers -ErrorAction Stop
+        $found += @($resp.value | Where-Object { $_.displayName -eq $DisplayName })
+        $uri = $resp.continuationUri
+    }
+    if ($found.Count -eq 0) {
+        throw "Lakehouse '$DisplayName' was not found in workspace $WorkspaceId."
+    }
+    if ($found.Count -gt 1) {
+        throw "Multiple lakehouses named '$DisplayName' were found. Pass the lakehouse GUID directly via -LakehouseName."
+    }
+    return $found[0].id
+}
+
+$WorkspaceId = $WorkspaceName
+$LakehouseId = $LakehouseName
+$useGuids    = $false
+if (-not (Test-IsGuid $WorkspaceName) -and -not (Test-IsValidContainerName $WorkspaceName)) {
+    Write-Host ("Resolving workspace '{0}' to its GUID via the Fabric API..." -f $WorkspaceName) -ForegroundColor Cyan
+    $token = Get-FabricAccessToken
+    $WorkspaceId = Resolve-FabricWorkspaceId -DisplayName $WorkspaceName -AccessToken $token
+    Write-Host ("  Workspace ID: {0}" -f $WorkspaceId) -ForegroundColor Green
+
+    # When the workspace is addressed by GUID, the lakehouse must also be a
+    # GUID - the data-plane API rejects mixed friendly-name + GUID requests
+    # with FriendlyNameSupportDisabled.
+    if (-not (Test-IsGuid $LakehouseName)) {
+        Write-Host ("Resolving lakehouse '{0}' to its GUID..." -f $LakehouseName) -ForegroundColor Cyan
+        $LakehouseId = Resolve-FabricLakehouseId -WorkspaceId $WorkspaceId -DisplayName $LakehouseName -AccessToken $token
+        Write-Host ("  Lakehouse ID: {0}" -f $LakehouseId) -ForegroundColor Green
+    }
+    $useGuids = $true
+}
+
+# ---------------------------------------------------------------------------
+# 4. Build OneLake storage context
 # ---------------------------------------------------------------------------
 # OneLake is exposed as a storage account named "onelake" on the
 # fabric.microsoft.com endpoint. -UseConnectedAccount passes the current Az
@@ -190,12 +281,11 @@ $ctx = New-AzStorageContext `
     -Endpoint 'fabric.microsoft.com'
 
 # ---------------------------------------------------------------------------
-# 4. Compose paths and enumerate soft-deleted blobs
+# 5. Compose paths and enumerate soft-deleted blobs
 # ---------------------------------------------------------------------------
-# In OneLake, the lakehouse item is addressed as "<name>.Lakehouse" and lives
-# directly under the workspace (filesystem) root. User data sits under
-# Files/ (unstructured) and Tables/ (Delta tables).
-$itemRoot = "$LakehouseName.Lakehouse"
+# In OneLake the lakehouse item is addressed as "<name>.Lakehouse" when using
+# friendly names, or just "<itemGuid>" when using GUIDs.
+$itemRoot = if ($useGuids) { $LakehouseId } else { "$LakehouseName.Lakehouse" }
 
 $scanPaths = @()
 switch ($Scope) {
@@ -214,7 +304,7 @@ if ($SubPath) {
 $inventory = New-Object System.Collections.Generic.List[object]
 
 foreach ($prefix in $scanPaths) {
-    Write-Host ("Scanning soft-deleted items under: {0}/{1}" -f $WorkspaceName, $prefix) -ForegroundColor Cyan
+    Write-Host ("Scanning soft-deleted items under: {0}/{1}" -f $WorkspaceId, $prefix) -ForegroundColor Cyan
 
     # -IncludeDeleted returns both active and soft-deleted blobs; we filter
     # to just the deleted ones via IsDeleted. On HNS-enabled OneLake, a
@@ -222,7 +312,7 @@ foreach ($prefix in $scanPaths) {
     # descendants are recovered together when the folder is restored.
     try {
         $blobs = Get-AzStorageBlob `
-            -Container $WorkspaceName `
+            -Container $WorkspaceId `
             -Context $ctx `
             -Prefix $prefix `
             -IncludeDeleted `
@@ -237,6 +327,7 @@ foreach ($prefix in $scanPaths) {
     foreach ($b in $blobs) {
         $inventory.Add([pscustomobject]@{
             Workspace                     = $WorkspaceName
+            WorkspaceId                   = $WorkspaceId
             Lakehouse                     = $LakehouseName
             Scope                         = if ($prefix -match '/Tables/') { 'Tables' } else { 'Files' }
             BlobName                      = $b.Name
@@ -252,7 +343,7 @@ foreach ($prefix in $scanPaths) {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Summary + export
+# 6. Summary + export
 # ---------------------------------------------------------------------------
 if ($inventory.Count -eq 0) {
     Write-Host 'No soft-deleted items found in the requested scope.' -ForegroundColor Yellow
